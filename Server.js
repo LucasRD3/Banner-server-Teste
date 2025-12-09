@@ -1,9 +1,10 @@
-// server.js (Versão Cloudinary com Upload)
+// server.js (Versão Cloudinary + Upstash Redis)
 
 const express = require('express');
 const cors = require('cors');
 const cloudinary = require('cloudinary').v2;
-const multer = require('multer'); // <--- NOVO: Importa Multer
+const multer = require('multer');
+const { Redis } = require('@upstash/redis'); // Importa Upstash Redis
 const app = express();
 
 // --- Configuração Cloudinary ---
@@ -13,73 +14,110 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// --- Configuração Upstash (Redis) ---
+// Configuração que utiliza as variáveis de ambiente
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+// Chaves que armazenarão as URLs dos banners no Redis
+const ACTIVE_BANNERS_KEY = 'active_banner_urls'; 
+const DISABLED_BANNERS_KEY = 'disabled_banner_urls'; 
+
 // --- Configuração Middleware ---
 app.use(cors());
+// Novo: Habilita o Express a processar o corpo da requisição em JSON (necessário para a rota PUT)
+app.use(express.json());
 
 // --- Configuração Multer (Armazenamento em Memória) ---
-// O Multer armazena o arquivo temporariamente na memória antes de enviá-lo ao Cloudinary.
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// A tag que será aplicada ao banner no Cloudinary
-const FOLDER_TAG = 'banners_tag'; // **Mantenha consistente com a rota GET!**
+const FOLDER_TAG = 'banners_tag'; 
 
-// --- ROTA API: Upload de Banner para o Cloudinary ---
+// --- ROTA API: Upload de Banner (Adiciona ao Cloudinary e ao Redis Ativo) ---
 app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
-    // 'bannerImage' deve corresponder ao atributo `name` do campo de arquivo no HTML
 
     if (!req.file) {
         return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
     }
 
     try {
-        // Converte o buffer do arquivo em uma string Data URL (Base64) para o Cloudinary
         const b64 = Buffer.from(req.file.buffer).toString("base64");
         let dataURI = "data:" + req.file.mimetype + ";base64," + b64;
 
-        // Faz o upload para o Cloudinary
+        // 1. Upload para o Cloudinary
         const result = await cloudinary.uploader.upload(dataURI, {
-            folder: 'banners_folder', // Opcional: define uma pasta
-            tags: [FOLDER_TAG]        // Aplica a tag para fácil pesquisa
+            folder: 'banners_folder', 
+            tags: [FOLDER_TAG]        
         });
+        
+        const bannerUrl = result.secure_url;
 
-        console.log(`Banner ${result.public_id} enviado com sucesso.`);
+        // 2. Adiciona a URL ao conjunto de banners ativos no Redis
+        await redis.sadd(ACTIVE_BANNERS_KEY, bannerUrl);
+
+        console.log(`Banner ${result.public_id} enviado e URL adicionada ao Redis.`);
         res.status(200).json({ 
             message: 'Upload bem-sucedido!', 
-            url: result.secure_url 
+            url: bannerUrl 
         });
 
     } catch (error) {
-        console.error('Erro ao fazer upload para o Cloudinary:', error);
-        // Retorna erro específico para o cliente
-        return res.status(500).json({ error: 'Falha ao fazer upload para o Cloudinary.', details: error.message });
+        console.error('Erro ao fazer upload para o Cloudinary ou Redis:', error);
+        return res.status(500).json({ error: 'Falha ao fazer upload.' });
     }
 });
 
-// --- ROTA API: Retorna todos os banners do Cloudinary (Mantida) ---
-app.get('/api/banners', async (req, res) => {
-    // ... (Código da rota GET permanece o mesmo) ...
-    // Note: Em Vercel, ambas as rotas POST e GET para o mesmo endpoint são tratadas.
-    
-    // ... Código da rota GET original
-    
+
+// --- NOVA ROTA API: Desativar Banner (Remove do Ativo e move para o Desativado) ---
+app.put('/api/banners/disable', async (req, res) => {
+    // Espera-se que o corpo da requisição contenha a 'url' do banner
+    const { url } = req.body; 
+
+    if (!url) {
+        return res.status(400).json({ error: 'A URL do banner é obrigatória no corpo da requisição.' });
+    }
+
     try {
-        const result = await cloudinary.search
-            .expression(`resource_type:image AND tags:${FOLDER_TAG}`)
-            .max_results(30)
-            .execute();
+        // Usa SMOVE do Redis: move a URL do conjunto ACTIVE para o DISABLED
+        const moved = await redis.smove(ACTIVE_BANNERS_KEY, DISABLED_BANNERS_KEY, url);
 
-        const bannerUrls = result.resources
-            .map(resource => resource.secure_url);
-
-        if (bannerUrls.length === 0) {
-            console.log("Nenhum banner encontrado no Cloudinary.");
+        if (moved === 1) {
+            // Se moved for 1, a URL foi movida com sucesso
+            console.log(`Banner desativado: ${url}`);
+            return res.json({ message: 'Banner desativado com sucesso.', url });
+        } else {
+            // Se moved for 0, a URL não estava no conjunto de ativos
+            return res.status(404).json({ error: 'Banner não encontrado na lista de ativos. (Já desativado ou URL incorreta)' });
         }
 
-        res.json({ banners: bannerUrls });
     } catch (error) {
-        console.error('Erro ao carregar banners do Cloudinary:', error);
-        return res.status(500).json({ error: 'Falha ao carregar banners do Cloudinary.' });
+        console.error('Erro ao desativar banner no Redis:', error);
+        return res.status(500).json({ error: 'Falha ao desativar banner.' });
+    }
+});
+
+
+// --- ROTA API: Retorna todos os banners ATIVOS (Consultando Apenas o Redis) ---
+app.get('/api/banners', async (req, res) => {
+    
+    try {
+        // Pega todos os membros do conjunto de banners ativos no Redis (operação muito rápida)
+        const activeUrls = await redis.smembers(ACTIVE_BANNERS_KEY);
+
+        if (activeUrls.length === 0) {
+            console.log("Nenhum banner ativo encontrado no Redis.");
+        }
+
+        // Retorna o array de URLs ativas
+        res.json({ banners: activeUrls });
+        
+    } catch (error) {
+        console.error('Erro ao carregar banners do Redis:', error);
+        // Em caso de falha, retorna um erro 500
+        return res.status(500).json({ error: 'Falha ao carregar banners do Redis.' });
     }
 });
 
