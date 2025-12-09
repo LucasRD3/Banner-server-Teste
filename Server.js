@@ -1,4 +1,4 @@
-// server.js (Versão Cloudinary + Upstash Redis)
+// server.js (Versão Final com Cloudinary e Upstash Redis)
 
 const express = require('express');
 const cors = require('cors');
@@ -27,8 +27,8 @@ const DISABLED_BANNERS_KEY = 'disabled_banner_urls';
 
 // --- Configuração Middleware ---
 app.use(cors());
-// Novo: Habilita o Express a processar o corpo da requisição em JSON (necessário para a rota PUT)
-app.use(express.json());
+// Habilita o Express a processar o corpo da requisição em JSON (necessário para as rotas PUT)
+app.use(express.json()); 
 
 // --- Configuração Multer (Armazenamento em Memória) ---
 const storage = multer.memoryStorage();
@@ -36,7 +36,9 @@ const upload = multer({ storage: storage });
 
 const FOLDER_TAG = 'banners_tag'; 
 
-// --- ROTA API: Upload de Banner (Adiciona ao Cloudinary e ao Redis Ativo) ---
+// ------------------------------------------------------------------------
+// --- ROTA 1: POST /api/banners (Upload e Ativação) -----------------------
+// ------------------------------------------------------------------------
 app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
 
     if (!req.file) {
@@ -66,30 +68,70 @@ app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
 
     } catch (error) {
         console.error('Erro ao fazer upload para o Cloudinary ou Redis:', error);
-        return res.status(500).json({ error: 'Falha ao fazer upload.' });
+        return res.status(500).json({ error: 'Falha ao fazer upload.', details: error.message });
     }
 });
 
+// ------------------------------------------------------------------------
+// --- ROTA 2: GET /api/banners (Lista Banners ATIVOS) ---------------------
+// ------------------------------------------------------------------------
+app.get('/api/banners', async (req, res) => {
+    
+    try {
+        // Pega todos os membros do conjunto de banners ativos no Redis
+        const activeUrls = await redis.smembers(ACTIVE_BANNERS_KEY);
 
-// --- NOVA ROTA API: Desativar Banner (Remove do Ativo e move para o Desativado) ---
+        if (activeUrls.length === 0) {
+            console.log("Nenhum banner ativo encontrado no Redis.");
+        }
+
+        res.json({ banners: activeUrls });
+        
+    } catch (error) {
+        console.error('Erro ao carregar banners ativos do Redis:', error);
+        return res.status(500).json({ error: 'Falha ao carregar banners ativos do Redis.' });
+    }
+});
+
+// ------------------------------------------------------------------------
+// --- ROTA 3: GET /api/banners/disabled (Lista Banners DESATIVADOS) --------
+// ------------------------------------------------------------------------
+app.get('/api/banners/disabled', async (req, res) => {
+    
+    try {
+        // Pega todos os membros do conjunto de banners DESATIVADOS no Redis
+        const disabledUrls = await redis.smembers(DISABLED_BANNERS_KEY);
+
+        if (disabledUrls.length === 0) {
+            console.log("Nenhum banner desativado encontrado no Redis.");
+        }
+
+        res.json({ banners: disabledUrls });
+        
+    } catch (error) {
+        console.error('Erro ao carregar banners desativados do Redis:', error);
+        return res.status(500).json({ error: 'Falha ao carregar banners desativados do Redis.' });
+    }
+});
+
+// ------------------------------------------------------------------------
+// --- ROTA 4: PUT /api/banners/disable (Desativa um Banner) ----------------
+// ------------------------------------------------------------------------
 app.put('/api/banners/disable', async (req, res) => {
-    // Espera-se que o corpo da requisição contenha a 'url' do banner
     const { url } = req.body; 
 
     if (!url) {
-        return res.status(400).json({ error: 'A URL do banner é obrigatória no corpo da requisição.' });
+        return res.status(400).json({ error: 'A URL do banner é obrigatória.' });
     }
 
     try {
-        // Usa SMOVE do Redis: move a URL do conjunto ACTIVE para o DISABLED
+        // SMOVE move o elemento de ACTIVE_BANNERS para DISABLED_BANNERS
         const moved = await redis.smove(ACTIVE_BANNERS_KEY, DISABLED_BANNERS_KEY, url);
 
         if (moved === 1) {
-            // Se moved for 1, a URL foi movida com sucesso
             console.log(`Banner desativado: ${url}`);
             return res.json({ message: 'Banner desativado com sucesso.', url });
         } else {
-            // Se moved for 0, a URL não estava no conjunto de ativos
             return res.status(404).json({ error: 'Banner não encontrado na lista de ativos. (Já desativado ou URL incorreta)' });
         }
 
@@ -99,25 +141,30 @@ app.put('/api/banners/disable', async (req, res) => {
     }
 });
 
+// ------------------------------------------------------------------------
+// --- ROTA 5: PUT /api/banners/enable (Reativa um Banner) ------------------
+// ------------------------------------------------------------------------
+app.put('/api/banners/enable', async (req, res) => {
+    const { url } = req.body;
 
-// --- ROTA API: Retorna todos os banners ATIVOS (Consultando Apenas o Redis) ---
-app.get('/api/banners', async (req, res) => {
-    
+    if (!url) {
+        return res.status(400).json({ error: 'A URL do banner é obrigatória.' });
+    }
+
     try {
-        // Pega todos os membros do conjunto de banners ativos no Redis (operação muito rápida)
-        const activeUrls = await redis.smembers(ACTIVE_BANNERS_KEY);
+        // SMOVE move o elemento de DISABLED_BANNERS para ACTIVE_BANNERS
+        const moved = await redis.smove(DISABLED_BANNERS_KEY, ACTIVE_BANNERS_KEY, url);
 
-        if (activeUrls.length === 0) {
-            console.log("Nenhum banner ativo encontrado no Redis.");
+        if (moved === 1) {
+            console.log(`Banner reativado: ${url}`);
+            return res.json({ message: 'Banner reativado com sucesso.', url });
+        } else {
+            return res.status(404).json({ error: 'Banner não encontrado na lista de desativados.' });
         }
 
-        // Retorna o array de URLs ativas
-        res.json({ banners: activeUrls });
-        
     } catch (error) {
-        console.error('Erro ao carregar banners do Redis:', error);
-        // Em caso de falha, retorna um erro 500
-        return res.status(500).json({ error: 'Falha ao carregar banners do Redis.' });
+        console.error('Erro ao reativar banner no Redis:', error);
+        return res.status(500).json({ error: 'Falha ao reativar banner.' });
     }
 });
 
