@@ -1,4 +1,4 @@
-// server.js (Versão Limpa e Otimizada com Cloudinary e Upstash Redis e PRIORIDADE)
+// server.js (Versão com Prioridade)
 
 const express = require('express');
 const cors = require('cors');
@@ -25,14 +25,13 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// --- CHAVES ATUALIZADAS PARA SUPORTE A DIAS DA SEMANA E PRIORIDADE ---
-// ACTIVE_BANNERS_KEY (HASH): URL -> DiaDaSemana ('ALL', 'MON', 'TUE', etc.)
+// --- CHAVES ATUALIZADAS ---
+// O HASH ACTIVE_BANNERS_KEY guardará: URL -> DiaDaSemana ('ALL', 'MON', 'TUE', etc.)
 const ACTIVE_BANNERS_KEY = 'active_banners_with_day'; 
-// PRIORITY_BANNERS_KEY (ZSET/Sorted Set): Prioridade (score) -> URL (member)
-const PRIORITY_BANNERS_KEY = 'active_banners_priority';
-// DISABLED_BANNERS_KEY (SET): Banners desativados
+// DISABLED_BANNERS_KEY continua sendo um SET.
 const DISABLED_BANNERS_KEY = 'disabled_banner_urls'; 
-
+// NOVO: Sorted Set (ZSET) para armazenar a PRIORIDADE (Score) -> URL (Member)
+const PRIORITY_BANNERS_KEY = 'priority_banners_zset'; 
 const CLOUDINARY_FOLDER = 'banners_folder'; 
 const FOLDER_TAG = 'banners_tag'; 
 
@@ -70,17 +69,13 @@ const upload = multer({ storage: storage });
  */
 const extractPublicIdFromUrl = (url) => {
     try {
-        // Exemplo: https://res.cloudinary.com/dvxxxxxx/image/upload/v1700000000/banners_folder/public_id_aqui.png
         const parts = url.split('/');
         
-        // Verifica se a URL tem o formato esperado
         if (parts.length < 2) return null;
         
-        // O nome do arquivo é o último item (excluindo a extensão)
         const fileNameWithExt = parts[parts.length - 1];
         const fileName = fileNameWithExt.substring(0, fileNameWithExt.lastIndexOf('.'));
         
-        // O nome da pasta é o penúltimo item, garantindo que seja o folder que definimos
         const folderName = parts[parts.length - 2]; 
         
         if (folderName !== CLOUDINARY_FOLDER) return null;
@@ -94,65 +89,61 @@ const extractPublicIdFromUrl = (url) => {
 };
 
 /**
- * Retorna os banners ativos com o respectivo dia.
- * @returns {Array<{url: string, day: string}>} Lista de banners ativos.
+ * Retorna os banners ativos com o respectivo dia E prioridade.
+ * @returns {Array<{url: string, day: string, priority: number}>} Lista de banners ativos.
  */
 const getActiveBannersWithDay = async () => {
+    // 1. Pega dados do HASH (URL -> DAY)
     const hashData = await redis.hgetall(ACTIVE_BANNERS_KEY);
     if (!hashData) return [];
 
-    return Object.entries(hashData).map(([url, day]) => ({
+    // 2. Pega todos os dados do ZSET (URL e PRIORIDADE)
+    // ZRANGE com WITHSCORES retorna uma lista plana de [member, score, member, score, ...]
+    // Pega do menor score (0) ao maior (-1)
+    const zsetMembers = await redis.zrange(PRIORITY_BANNERS_KEY, 0, -1, { withScores: true });
+
+    const zsetMap = new Map();
+    // Converte a lista plana em um Map { url: priority }
+    for (let i = 0; i < zsetMembers.length; i += 2) {
+        zsetMap.set(zsetMembers[i], zsetMembers[i + 1]);
+    }
+
+    // 3. Combina HASH e ZSET
+    const combinedBanners = Object.entries(hashData).map(([url, day]) => ({
         url,
         day,
-    }));
+        // Pega a prioridade do Map. Usa 0 como padrão se não for encontrado.
+        priority: zsetMap.has(url) ? parseInt(zsetMap.get(url), 10) : 0, 
+    })).filter(banner => zsetMap.has(banner.url)); // Garante que só retorna banners que estão em ambas as estruturas.
+    
+    return combinedBanners;
 };
 
-/**
- * Retorna os banners ativos ordenados por prioridade (do maior score/prioridade para o menor).
- * @returns {Array<{url: string, priority: number}>} Lista de banners ativos com prioridade.
- */
-const getActiveBannersWithPriority = async () => {
-    // Retorna todos os membros e seus scores (prioridades) do maior para o menor.
-    // 'WITHSCORES' retorna uma array [member1, score1, member2, score2, ...]
-    const zsetData = await redis.zrevrange(PRIORITY_BANNERS_KEY, 0, -1, 'WITHSCORES');
-    
-    if (!zsetData || zsetData.length === 0) return [];
-    
-    const banners = [];
-    for (let i = 0; i < zsetData.length; i += 2) {
-        const url = zsetData[i];
-        const priority = parseInt(zsetData[i + 1], 10);
-        banners.push({ url, priority });
-    }
-    
-    return banners;
-};
 
 // ------------------------------------------------------------------------
 // --- 4. ROTAS ---
 // ------------------------------------------------------------------------
 
 /**
- * POST /api/banners: Upload de imagem para o Cloudinary e ativação no Redis.
- * Aceita 'day' (padrão 'ALL') e 'priority' (padrão 0).
+ * POST /api/banners: Upload de imagem, ativação no Redis (com dia e prioridade).
  */
 app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
     }
     
-    // Obtém dia e prioridade
+    // Obtém o dia e a prioridade
     const day = req.body.day ? req.body.day.toUpperCase() : 'ALL';
-    const priority = parseInt(req.body.priority || '0', 10); // Padrão 0
-    
-    // Validações
+    const priority = req.body.priority ? parseInt(req.body.priority, 10) : 0; 
     const validDays = [...Object.values(DAYS_MAP), 'ALL'];
+
     if (!validDays.includes(day)) {
         return res.status(400).json({ error: `Dia inválido. Use: ${validDays.join(', ')}` });
     }
     if (isNaN(priority) || priority < 0) {
         return res.status(400).json({ error: 'Prioridade inválida. Deve ser um número inteiro não negativo.' });
     }
+
 
     try {
         const b64 = Buffer.from(req.file.buffer).toString("base64");
@@ -166,18 +157,19 @@ app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
         
         const bannerUrl = result.secure_url;
 
-        // 2. Adiciona a URL e o Dia ao HASH de banners ativos no Redis
+        // 2. Adiciona a URL e o Dia ao HASH de banners ativos
         await redis.hset(ACTIVE_BANNERS_KEY, { [bannerUrl]: day });
         
-        // 3. Adiciona/Atualiza a URL e a Prioridade ao ZSET de prioridade no Redis
+        // 3. Adiciona a URL e a Prioridade ao ZSET
         await redis.zadd(PRIORITY_BANNERS_KEY, { score: priority, member: bannerUrl });
 
+
         console.log(`✅ Banner ${result.public_id} enviado e URL adicionada ao Redis com dia: ${day} e prioridade: ${priority}.`);
-        res.status(201).json({ // 201 Created é mais adequado para POST de criação
+        res.status(201).json({ 
             message: 'Upload bem-sucedido e banner ativado!', 
             url: bannerUrl,
             day: day,
-            priority: priority
+            priority: priority // Retorna a prioridade
         });
 
     } catch (error) {
@@ -187,33 +179,30 @@ app.post('/api/banners', upload.single('bannerImage'), async (req, res) => {
 });
 
 /**
- * GET /api/banners: Lista todos os banners ATIVOS *PARA O DIA ATUAL*, ORDENADOS POR PRIORIDADE.
+ * GET /api/banners: Lista todos os banners ATIVOS *PARA O DIA ATUAL*, ordenados por PRIORIDADE.
  */
 app.get('/api/banners', async (req, res) => {
     try {
-        const today = new Date().getDay(); // 0=Dom, 1=Seg, ..., 6=Sáb
-        const todayKey = DAYS_MAP[today]; // 'SUN', 'MON', etc.
+        const today = new Date().getDay(); 
+        const todayKey = DAYS_MAP[today]; 
         
-        // 1. Obtém todas as URLs ativas e suas prioridades, JÁ ORDENADAS (do maior para o menor)
-        const priorityBanners = await getActiveBannersWithPriority(); // [{url, priority}]
-        
-        // 2. Obtém o mapa de URL -> Dia da Semana
-        const activeBannersWithDay = await getActiveBannersWithDay(); // [{url, day}]
-        const dayMap = activeBannersWithDay.reduce((map, banner) => {
-            map[banner.url] = banner.day;
-            return map;
-        }, {});
-        
-        // 3. Filtra banners que são 'ALL' ou correspondem ao dia de hoje, mantendo a ordem de prioridade
-        const filteredUrls = priorityBanners
-            .filter(banner => dayMap[banner.url] && (dayMap[banner.url] === 'ALL' || dayMap[banner.url] === todayKey))
-            .map(banner => banner.url);
+        // Obtém todas as URLs ativas, seus respectivos dias E PRIORIDADES
+        const activeBanners = await getActiveBannersWithDay();
+
+        // 1. Filtra banners que são 'ALL' ou correspondem ao dia de hoje
+        let filteredBanners = activeBanners
+            .filter(banner => banner.day === 'ALL' || banner.day === todayKey);
+
+        // 2. Ordena por prioridade (do maior para o menor)
+        filteredBanners.sort((a, b) => b.priority - a.priority);
+
+        // Retorna apenas a lista de URLs, já ordenadas
+        const filteredUrls = filteredBanners.map(banner => banner.url);
         
         if (filteredUrls.length === 0) {
             console.log("ℹ️ Nenhum banner ativo encontrado para o dia de hoje.");
         }
 
-        // Retorna apenas a lista de URLs ORDENADA POR PRIORIDADE
         res.json({ banners: filteredUrls, day: todayKey });
         
     } catch (error) {
@@ -227,30 +216,13 @@ app.get('/api/banners', async (req, res) => {
  */
 app.get('/api/banners/all', async (req, res) => {
     try {
-        // Combina as informações de dia (HASH) e prioridade (ZSET)
-        const activeBannersWithDay = await getActiveBannersWithDay();
-        const activeBannersWithPriority = await getActiveBannersWithPriority();
-
-        // Cria um mapa de URL -> Prioridade
-        const priorityMap = activeBannersWithPriority.reduce((map, banner) => {
-            map[banner.url] = banner.priority;
-            return map;
-        }, {});
-        
-        // Combina os dados e adiciona a prioridade (se existir)
-        const combinedBanners = activeBannersWithDay.map(banner => ({
-            ...banner,
-            priority: priorityMap[banner.url] !== undefined ? priorityMap[banner.url] : 0 // Prioridade 0 se não estiver no ZSET
-        }));
-
-        // Opcionalmente, ordena o resultado final para o Dashboard por URL ou prioridade
-        combinedBanners.sort((a, b) => b.priority - a.priority);
-
-        if (combinedBanners.length === 0) {
+        // Agora retorna {url, day, priority}
+        const activeBanners = await getActiveBannersWithDay(); 
+        if (activeBanners.length === 0) {
             console.log("ℹ️ Nenhum banner ativo encontrado.");
         }
         // Retorna a lista de objetos {url, day, priority}
-        res.json({ banners: combinedBanners });
+        res.json({ banners: activeBanners });
         
     } catch (error) {
         console.error('❌ Erro ao carregar todos os banners ativos do Redis:', error);
@@ -277,7 +249,6 @@ app.get('/api/banners/disabled', async (req, res) => {
 
 /**
  * PUT /api/banners/disable: Move um banner de ativo para desativado no Redis.
- * Remove a URL do HASH (dia) e do ZSET (prioridade), e a adiciona ao SET de desativados.
  */
 app.put('/api/banners/disable', async (req, res) => {
     const { url } = req.body; 
@@ -287,13 +258,12 @@ app.put('/api/banners/disable', async (req, res) => {
     }
 
     try {
-        // 1. Remove do HASH de ativos (dia)
-        const removedFromActiveDay = await redis.hdel(ACTIVE_BANNERS_KEY, url);
+        // 1. Remove do HASH de ativos
+        const removedFromActive = await redis.hdel(ACTIVE_BANNERS_KEY, url);
         // 2. Remove do ZSET de prioridade
-        const removedFromPriority = await redis.zrem(PRIORITY_BANNERS_KEY, url);
+        const removedFromPriority = await redis.zrem(PRIORITY_BANNERS_KEY, url); 
 
-        if (removedFromActiveDay === 0 && removedFromPriority === 0) {
-            // Se não estava em NENHUM dos ativos, tenta remover do desativado para garantir que não está em nenhum lugar antes de falhar
+        if (removedFromActive === 0) {
             const wasAlreadyDisabled = await redis.sismember(DISABLED_BANNERS_KEY, url);
             if(wasAlreadyDisabled) {
                  return res.status(404).json({ error: 'Banner já está na lista de desativados.' });
@@ -304,7 +274,7 @@ app.put('/api/banners/disable', async (req, res) => {
         // 3. Adiciona ao SET de desativados
         await redis.sadd(DISABLED_BANNERS_KEY, url);
 
-        console.log(`✔️ Banner desativado: ${url}`);
+        console.log(`✔️ Banner desativado: ${url}. Removido do HASH (${removedFromActive}) e ZSET (${removedFromPriority}).`);
         return res.json({ message: 'Banner desativado com sucesso.', url });
 
     } catch (error) {
@@ -315,29 +285,29 @@ app.put('/api/banners/disable', async (req, res) => {
 
 
 /**
- * PUT /api/banners/enable: Move um banner de desativado para ativo no Redis, definindo o dia e a prioridade.
- * Dia padrão: 'ALL', Prioridade padrão: 0.
+ * PUT /api/banners/enable: Move um banner de desativado para ativo, definindo dia E prioridade.
  */
 app.put('/api/banners/enable', async (req, res) => {
-    const { url, day, priority } = req.body;
+    const { url, day, priority } = req.body; // NOVO: Recebe priority
     
-    // Dia padrão é 'ALL' se não for fornecido
     const targetDay = day ? day.toUpperCase() : 'ALL';
-    // Prioridade padrão é 0 se não for fornecida
-    const targetPriority = parseInt(priority || '0', 10);
-    
+    const targetPriority = priority ? parseInt(priority, 10) : 0; // NOVO: Target Priority
     const validDays = [...Object.values(DAYS_MAP), 'ALL'];
 
-    if (!url || !validDays.includes(targetDay) || isNaN(targetPriority) || targetPriority < 0) {
-        return res.status(400).json({ error: 'A URL do banner é obrigatória, o dia e a prioridade devem ser válidos.' });
+    if (!url || !validDays.includes(targetDay)) {
+        return res.status(400).json({ error: 'A URL do banner é obrigatória e o dia deve ser válido.' });
     }
+    // NOVO: Validação da Prioridade
+    if (isNaN(targetPriority) || targetPriority < 0) {
+        return res.status(400).json({ error: 'A URL do banner é obrigatória, o dia deve ser válido e a prioridade deve ser um número não negativo.' });
+    }
+
 
     try {
         // 1. Remove do SET de desativados
         const removedFromDisabled = await redis.srem(DISABLED_BANNERS_KEY, url);
 
         if (removedFromDisabled === 0) {
-            // Se não estava no desativado, verifica se já está no ativo para evitar duplicação e notificar
             const wasAlreadyActive = await redis.hget(ACTIVE_BANNERS_KEY, url);
             if (wasAlreadyActive) {
                 return res.status(404).json({ error: 'Banner já está ativo.' });
@@ -348,8 +318,9 @@ app.put('/api/banners/enable', async (req, res) => {
         // 2. Adiciona ao HASH de ativos com a nova regra de dia
         await redis.hset(ACTIVE_BANNERS_KEY, { [url]: targetDay });
         
-        // 3. Adiciona ao ZSET de prioridade
+        // 3. Adiciona ao ZSET de prioridade com o novo score
         await redis.zadd(PRIORITY_BANNERS_KEY, { score: targetPriority, member: url });
+
 
         console.log(`✔️ Banner reativado: ${url} para o dia: ${targetDay} com prioridade: ${targetPriority}`);
         return res.json({ message: 'Banner reativado com sucesso.', url, day: targetDay, priority: targetPriority });
@@ -393,31 +364,32 @@ app.put('/api/banners/update-day', async (req, res) => {
     }
 });
 
+
 /**
- * PUT /api/banners/update-priority: Atualiza a prioridade de exibição de um banner ATIVO.
+ * NOVO: PUT /api/banners/update-priority: Atualiza a prioridade (score no ZSET) de um banner ATIVO.
  */
 app.put('/api/banners/update-priority', async (req, res) => {
     const { url, priority } = req.body;
     
-    const targetPriority = parseInt(priority, 10);
-
+    const targetPriority = priority ? parseInt(priority, 10) : 0;
+    
     if (!url || isNaN(targetPriority) || targetPriority < 0) {
         return res.status(400).json({ error: 'A URL do banner e a prioridade (número não negativo) são obrigatórias.' });
     }
     
     try {
-        // 1. Verifica se o banner existe no HASH de ativos (se for ativo, deve ter uma regra de dia)
+        // 1. Verifica se o banner existe no HASH de ativos (apenas banners ativos podem ter prioridade)
         const currentDay = await redis.hget(ACTIVE_BANNERS_KEY, url);
 
         if (!currentDay) {
-            return res.status(404).json({ error: 'Banner não encontrado na lista de ativos.' });
+            return res.status(404).json({ error: 'Banner não encontrado na lista de ativos. A prioridade só pode ser definida para banners ativos.' });
         }
 
-        // 2. Atualiza/Adiciona o score no ZSET de prioridade. ZADD é idempotente.
+        // 2. Atualiza o score (prioridade) no ZSET. ZADD atualiza se o membro já existe.
         await redis.zadd(PRIORITY_BANNERS_KEY, { score: targetPriority, member: url });
 
         console.log(`🔄 Prioridade do Banner atualizada: ${url} para ${targetPriority}.`);
-        return res.json({ message: 'Prioridade de exibição atualizada com sucesso.', url, priority: targetPriority });
+        return res.json({ message: 'Prioridade atualizada com sucesso.', url, priority: targetPriority });
 
     } catch (error) {
         console.error('❌ Erro ao atualizar a prioridade do banner no Redis:', error);
@@ -437,14 +409,14 @@ app.delete('/api/banners', async (req, res) => {
     }
 
     try {
-        // 1. Tenta remover a URL dos locais do Redis (Hash, Set e ZSet)
-        const removedActiveDay = await redis.hdel(ACTIVE_BANNERS_KEY, url);
-        const removedPriority = await redis.zrem(PRIORITY_BANNERS_KEY, url); // Novo: Remove do ZSet
+        // 1. Tenta remover a URL dos três locais do Redis (Hash, Set e ZSet)
+        const removedActive = await redis.hdel(ACTIVE_BANNERS_KEY, url);
         const removedDisabled = await redis.srem(DISABLED_BANNERS_KEY, url);
-        const redisRemoved = removedActiveDay + removedPriority + removedDisabled;
+        const removedPriority = await redis.zrem(PRIORITY_BANNERS_KEY, url); // NOVO: Remove do ZSET
+        const redisRemoved = removedActive + removedDisabled + removedPriority;
+
 
         if (redisRemoved === 0) {
-            // Se não foi removido de nenhum lugar, a URL não existe
             return res.status(404).json({ error: 'Banner não encontrado nos registros do Redis.' });
         }
 
@@ -466,7 +438,6 @@ app.delete('/api/banners', async (req, res) => {
              cloudinaryStatus = 'removed_from_redis_only (file_not_found_on_cloud)';
         } else if (cloudinaryStatus !== 'ok') {
             console.error('❌ Erro ao deletar no Cloudinary:', destroyResult);
-            // Retorna sucesso para o Redis mas notifica o problema no Cloudinary
             return res.status(200).json({ message: 'Banner removido do Redis, mas houve um erro na exclusão do Cloudinary.', url, cloudinaryStatus });
         }
 
